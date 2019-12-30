@@ -41,8 +41,8 @@ const char* PARAM_REST_DELAY = "rest_delay";
  * CONFIGURATION
  */
 bool isDebug = true;
-int workDelay = 500;
-int restDelay = 500;
+int workDelay = 20000;
+int restDelay = 5000;
 #define NUM_LEDS 12
 #define DATA_PIN 0
 
@@ -211,6 +211,11 @@ void setup()
     FastLED.addLeds<WS2812, DATA_PIN, GRB>(leds, NUM_LEDS);
     FastLED.setBrightness(64); // 0-255 value
 
+    runner.init(); // task scheduler init
+    runner.addTask(taskDoWork);
+    runner.addTask(taskDoRest);
+    taskDoWork.enable();
+
     AsyncWiFiManager wifiManager(&server, &dns);
     //wifiManager.resetSettings();
 
@@ -269,12 +274,8 @@ void setup()
     server.onNotFound(notFound);
     server.begin();
 
-    runner.init(); // task scheduler init
     runner.addTask(taskUpdateMDNS);
-    runner.addTask(taskDoWork);
-    runner.addTask(taskDoRest);
     taskUpdateMDNS.enable();
-    taskDoWork.enable();
 }
 
 void loop()

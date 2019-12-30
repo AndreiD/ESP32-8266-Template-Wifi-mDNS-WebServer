@@ -1,5 +1,5 @@
 /*
- * ASYNC WEB SERVER, PERMANENT STORAGE, WIFI PORTAL, 2812 Leds, mDNS., task scheduler WHAT MORE COULD ONE WANT ?
+ * ASYNC WEB SERVER, PERMANENT STORAGE, WIFI PORTAL, 2812 Leds, mDNS., task scheduler written by someone that doesn't know C++ :)
 */
 
 #include <FS.h> //this needs to be first, or it all crashes and burns...

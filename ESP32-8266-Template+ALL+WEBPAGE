@@ -1,0 +1,354 @@
+/*
+ * ASYNC WEB SERVER, PERMANENT STORAGE, WIFI PORTAL, 2812 Leds, mDNS., task scheduler WHAT MORE COULD ONE WANT ?
+*/
+
+#include <FS.h> //this needs to be first, or it all crashes and burns...
+
+#if defined(ESP8266)
+#include <ESP8266WiFi.h>
+#else
+#include <WiFi.h>
+#endif
+
+//needed for library
+#include <ESP8266mDNS.h>
+#include <ESPAsyncWebServer.h>
+#include <ESPAsyncWiFiManager.h>
+#include <WiFiClient.h>
+
+// web server
+#if defined(ESP8266)
+#include <ESPAsyncTCP.h>
+#else
+#include <AsyncTCP.h>
+#endif
+
+// for storage
+#include <ArduinoJson.h>
+
+// FastLED
+#define FASTLED_ESP8266_RAW_PIN_ORDER //D3 or GPIO0 is DATA_PIN 0
+#include <FastLED.h>
+
+// Other
+#include <TaskScheduler.h> //https://github.com/arkhipenko/TaskScheduler/tree/master/examples
+
+const char* PARAM_DEBUG = "debug";
+const char* PARAM_WORK_DELAY = "work_delay";
+const char* PARAM_REST_DELAY = "rest_delay";
+
+/*
+ * CONFIGURATION
+ */
+bool isDebug = true;
+double workDelay = 20;
+double restDelay = 5;
+#define NUM_LEDS 12
+#define DATA_PIN 0
+
+CRGB leds[NUM_LEDS];
+AsyncWebServer server(80);
+DNSServer dns;
+void taskUpdateMDNSCallback(); // prototype
+void taskDoWorkCallback(); // prototype
+void taskDoRestCallback(); // prototype
+
+Task taskUpdateMDNS(TASK_IMMEDIATE, TASK_FOREVER, &taskUpdateMDNSCallback);
+Task taskDoWork(10000, TASK_FOREVER, &taskDoWorkCallback);
+Task taskDoRest(10000, TASK_FOREVER, &taskDoRestCallback);
+Scheduler runner, hpr;
+
+void fadeall()
+{
+    for (int i = 0; i < NUM_LEDS; i++) {
+        leds[i] = CRGB::Black;
+        FastLED.show();
+    }
+}
+
+void workMode()
+{
+    fadeall();
+    for (int i = 0; i < NUM_LEDS; i++) {
+
+        leds[i] = CHSV(170, 255, 255);
+        FastLED.show();
+        Serial.printf("\nWaiting for %f between leds", double(workDelay * 60000) / NUM_LEDS);
+        delay(double(workDelay * 60000) / NUM_LEDS);
+        leds[i] = CRGB::Black;
+        FastLED.show();
+    }
+}
+
+void restMode()
+{
+    // light all reds
+    for (int i = 0; i < NUM_LEDS; i++) {
+        leds[i] = CHSV(15, 255, 255);
+        FastLED.show();
+    }
+
+    for (int i = 0; i < NUM_LEDS; i++) {
+        delay(double(restDelay * 60000) / NUM_LEDS);
+        leds[i] = CRGB::Black;
+        FastLED.show();
+    }
+}
+
+bool loadConfig()
+{
+    File configFile = SPIFFS.open("/config.json", "r");
+    if (!configFile) {
+        Serial.println("Failed to open config file");
+        return false;
+    }
+
+    size_t size = configFile.size();
+    if (size > 1024) {
+        Serial.println("Config file size is too large!");
+        return false;
+    }
+    std::unique_ptr<char[]> buf(new char[size]);
+    configFile.readBytes(buf.get(), size);
+
+    StaticJsonDocument<200> doc;
+    auto error = deserializeJson(doc, buf.get());
+    if (error) {
+        Serial.println("Failed to parse config file");
+        return false;
+    }
+
+    isDebug = doc["debug"];
+    workDelay = doc["work_delay"];
+    restDelay = doc["rest_delay"];
+
+    if (workDelay == 0) {
+        workDelay = 20;
+    }
+    if (restDelay == 0) {
+        restDelay = 5;
+    }
+
+    if (isDebug) {
+        Serial.print("~~~~~~~~~~~~~~~~~~~~~~~~~~ DEBUG BUILD ~~~~~~~~~~~~~~~~~~~~~~~~~~\n");
+        Serial.printf("Work Delay Minutes %f\n", workDelay);
+        Serial.printf("Rest Delay Minutes %f\n", restDelay);
+    } else {
+        Serial.print("-------------------------- PRODUCTION BUILD --------------------------\n");
+        Serial.printf("Work Delay Minutes %f\n", workDelay);
+        Serial.printf("Rest Delay Minutes %f\n", restDelay);
+    }
+    return true;
+}
+
+// save config, also replaces the global settings
+bool saveConfig(String _debug, double _workDelay, double _restDelay)
+{
+    Serial.println("saving new configuration");
+    StaticJsonDocument<200> doc;
+
+    if (_debug == "true") {
+        doc["debug"] = true;
+        isDebug = true;
+    } else {
+        doc["debug"] = false;
+        isDebug = false;
+    }
+    doc["work_delay"] = _workDelay;
+    doc["rest_delay"] = _restDelay;
+
+    workDelay = _workDelay;
+    restDelay = _restDelay;
+
+    File configFile = SPIFFS.open("/config.json", "w");
+    if (!configFile) {
+        Serial.println("Failed to open config file for writing");
+        return false;
+    }
+
+    serializeJson(doc, configFile);
+    return true;
+}
+
+void taskUpdateMDNSCallback()
+{
+    MDNS.update();
+}
+
+void taskDoWorkCallback()
+{
+    taskDoWork.disable();
+    workMode();
+    taskDoRest.enable();
+}
+
+void taskDoRestCallback()
+{
+    taskDoRest.disable();
+    restMode();
+    taskDoWork.enable();
+}
+
+void notFound(AsyncWebServerRequest* request)
+{
+    request->send(404, "text/plain", "Not found");
+}
+
+void setup()
+{
+    // put your setup code here, to run once:
+    delay(500);
+    Serial.begin(115200);
+    if (!SPIFFS.begin()) {
+        Serial.println("Failed to mount file system");
+        return;
+    }
+
+    if (!loadConfig()) {
+        Serial.println("Failed to load config");
+    } else {
+        Serial.println("Config loaded");
+    }
+
+    FastLED.addLeds<WS2812, DATA_PIN, GRB>(leds, NUM_LEDS);
+    FastLED.setBrightness(64); // 0-255 value
+
+    runner.init(); // task scheduler init
+    runner.addTask(taskDoWork);
+    runner.addTask(taskDoRest);
+    taskDoWork.enable();
+
+    AsyncWiFiManager wifiManager(&server, &dns);
+    //wifiManager.resetSettings();
+
+    IPAddress _ip = IPAddress(10, 1, 104, 1);
+    IPAddress _gw = IPAddress(10, 1, 104, 1);
+    IPAddress _sn = IPAddress(255, 255, 255, 0);
+    wifiManager.setAPStaticIPConfig(_ip, _gw, _sn);
+
+    if (!wifiManager.autoConnect("PomodoroX")) {
+        Serial.println("failed to connect, we should reset as see if it connects");
+        delay(3000);
+        ESP.reset();
+        delay(5000);
+    }
+
+    Serial.println("connected successfully to the WiFi");
+
+    Serial.println("local ip");
+    Serial.println(WiFi.localIP());
+
+    if (!MDNS.begin("pomodorox")) {
+        Serial.println("Error setting up MDNS responder!");
+        while (1) {
+            delay(1000);
+        }
+    }
+
+    Serial.println("mDNS responder started");
+    MDNS.addService("http", "tcp", 80);
+    MDNS.addServiceTxt("iotdevice", "tcp", "app_name", "pomodorox");
+    MDNS.addServiceTxt("iotdevice", "tcp", "app_version", "0.0.1");
+
+    // web server
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
+        AsyncResponseStream* response = request->beginResponseStream("text/html");
+        response->print("<!DOCTYPE html>");
+        response->print("<html lang='en'>");
+        response->print("<head>");
+        response->print("<meta charset='utf-8' />");
+        response->print("<meta name='viewport' content='width=device-width, initial-scale=1.0' />");
+        response->print("<meta name='description' content='promodorox' />");
+        response->print("<title>PomodoroX</title>");
+        response->print("<link rel='stylesheet' href='https://unpkg.com/purecss@1.0.1/build/pure-min.css' integrity='sha384-' crossorigin='anonymous' />");
+        response->print("<link rel='stylesheet' href='https://unpkg.com/purecss@1.0.1/build/grids-responsive-min.css' />");
+        response->print("<link rel='stylesheet' href='https://netdna.bootstrapcdn.com/font-awesome/4.0.3/css/font-awesome.css' />");
+        response->print("<style rel='stylesheet'>*{-webkit-box-sizing:border-box;-moz-box-sizing:border-box;box-sizing:border-box}body{line-height:1.7em;color:#7f8c8d;font-size:13px}h1,h2,h3,h4,h5,h6,label{color:#34495e}.pure-img-responsive{max-width:100%;height:auto}.l-box{padding:1em}.l-box-lrg{padding:2em;border-bottom:1px solid rgba(0,0,0,0.1)}.is-center{text-align:center}.pure-form label{margin:1em 0 0;font-weight:bold;font-size:100%}.pure-form input[type]{border:2px solid #ddd;box-shadow:none;font-size:100%;width:100%;margin-bottom:1em}.pure-button{background-color:#1f8dd6;color:white;padding:0.5em 2em;border-radius:5px}a.pure-button-primary{background:white;color:#1f8dd6;border-radius:5px;font-size:120%}.home-menu{padding:0.5em;text-align:center;box-shadow:0 1px 1px rgba(0,0,0,0.1)}.home-menu{background:#2d3e50}.pure-menu.pure-menu-fixed{border-bottom:none;z-index:4}.home-menu .pure-menu-heading{color:white;font-weight:400;font-size:130%}.home-menu .pure-menu-selected a{color:white}.home-menu a{color:#6fbef3}.home-menu li a:hover, .home-menu li a:focus{background:none;border:none;color:#aecfe5}.splash-container{background:#1f8dd6;z-index:1;overflow:hidden;width:100%;height:88%;top:0;left:0;position:fixed !important}.splash{width:80%;height:50%;margin:auto;position:absolute;top:100px;left:0;bottom:0;right:0;text-align:center;}.splash-head{font-size:20px;font-weight:bold;color:white;border:3px solid white;padding:1em 1.6em;font-weight:100;border-radius:5px;line-height:1em}.splash-subhead{color:white;letter-spacing:0.05em;opacity:0.8}.content-wrapper{position:absolute;top:97%;width:100%;min-height:12%;z-index:2;background:white}.content{padding:1em 1em 3em}.content-head{font-weight:400;letter-spacing:0.1em;margin:2em 0 1em}.content-head-ribbon{color:white}.content-subhead{color:#1f8dd6}.content-subhead i{margin-right:7px}.ribbon{background:#2d3e50;color:#aaa}.footer{background:#111;position:fixed;bottom:0;width:100%}@media (min-width: 48em){body{font-size:16px}.home-menu{text-align:left}.home-menu ul{float:right}.splash{width:50%;height:50%}.splash-head{font-size:250%}.l-box-lrg{border:none}}@media (min-width: 78em){.splash-head{font-size:300%}}</style>");
+        response->print("<script src='https://ajax.googleapis.com/ajax/libs/jquery/3.4.1/jquery.min.js'></script>");
+        response->print("</head>");
+        response->print("<body>");
+        response->print("<div class='header'>");
+        response->print("<div class='home-menu pure-menu pure-menu-horizontal pure-menu-fixed'>");
+        response->print("<a class='pure-menu-heading' href=''>PromodoroX</a>");
+        response->print("</div>");
+        response->print("</div>");
+        response->print("<div class='content'>");
+        response->print("<div class='pure-g' style='margin-top:50px'>");
+        response->print("<div class='l-box pure-u-1 pure-u-md-1-2 pure-u-lg-1-4'>");
+        response->print("<h3 class='content-subhead'>");
+        response->print("<i class='fa fa-rocket'>");
+        response->print("</i>Time Configuration</h3>");
+        response->print("<form class='pure-form pure-form-stacked'>");
+        response->print("<fieldset>");
+        response->print("<label for='work_time'>Work Time (minutes)");
+        response->print("</label>");
+        response->print("<input id='work_time' type='number' value='20' />");
+        response->print("<label for='rest_time'>Rest Time (minutes)</label>");
+        response->print("<input id='rest_time' type='number' value='5' />");
+        response->print("<button type='submit' id='save_times' class='pure-button pure-button-primary'>Save</button>");
+        response->print("</fieldset>");
+        response->print("</form>");
+        response->print("</div>");
+        response->print("<div class='l-box pure-u-1 pure-u-md-1-2 pure-u-lg-1-4'>");
+        response->print("<h3 class='content-subhead'>");
+        response->print("<i class='fa fa-mobile'>");
+        response->print("</i>Responsive Layouts</h3>");
+        response->print("<p>Phasellus eget enim eu lectus faucibus vestibulum. Suspendisse sodales pellentesque elementum.");
+        response->print("</p>");
+        response->print("</div>");
+        response->print("</div>");
+        response->print("</div>");
+        response->print("<div id='notification' class='is-center 1-box'>");
+        response->print("</div>");
+        response->print("<div class='footer l-box is-center'> Made by https://github.com/AndreiD");
+        response->print("</div>");
+        response->print("<script type='text/javascript'>$(document).ready(function(){$('#save_times').click(function(e){e.preventDefault();");
+        response->print("var workTime = $('#work_time').val();var restTime = $('#rest_time').val();$.ajax({url:window.location.origin+'/settings?debug=false&work_delay='+workTime+'&rest_delay='+restTime,type:'GET',error:function(err){alert(err);},success:function(data){alert('settings saved');}}); }); })");
+        response->print("</script>");
+        response->print("</body>");
+        response->print("</html>");
+        request->send(response);
+    });
+
+    server.on("/settings", HTTP_GET, [](AsyncWebServerRequest* request) {
+        String debugAux = "";
+        String workDelayAux = "";
+        String restDelayAux = "";
+        if (request->hasParam(PARAM_DEBUG) && request->hasParam(PARAM_REST_DELAY) && request->hasParam(PARAM_WORK_DELAY)) {
+            debugAux = request->getParam(PARAM_DEBUG)->value();
+            workDelayAux = request->getParam(PARAM_WORK_DELAY)->value();
+            restDelayAux = request->getParam(PARAM_REST_DELAY)->value();
+            saveConfig(debugAux, workDelayAux.toDouble(), restDelayAux.toDouble());
+
+        } else {
+            request->send(400, "text/plain", "Please make sure you include ALL the query parameters in the requesty");
+            return;
+        }
+        request->send(200, "text/plain", "settings saved");
+    });
+
+    //remove the favicon error
+    server.on("/favicon.ico", HTTP_GET, [](AsyncWebServerRequest* request) {
+        AsyncResponseStream* response = request->beginResponseStream("image/x-icon");
+        response->print("");
+        request->send(response);
+    });
+
+    // get the settings
+    server.on("/saved_settings", HTTP_GET, [](AsyncWebServerRequest* request) {
+        AsyncResponseStream* response = request->beginResponseStream("text/json");
+        response->print("");
+        request->send(response);
+    });
+
+    server.onNotFound(notFound);
+    server.begin();
+
+    runner.addTask(taskUpdateMDNS);
+    taskUpdateMDNS.enable();
+}
+
+void loop()
+{
+    runner.execute(); // check the tasks for more
+}
